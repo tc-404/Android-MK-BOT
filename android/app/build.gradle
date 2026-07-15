@@ -1,0 +1,127 @@
+
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+    id 'dev.flutter.flutter-gradle-plugin'
+}
+def keystorePropertiesFile = rootProject.file('key.properties')
+def keystoreProperties = new Properties()
+def hasKeystoreFile = keystorePropertiesFile.exists()
+if (hasKeystoreFile) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+} else {
+    logger.lifecycle('Warning: key.properties not found, fallback to debug keystore.')
+}
+android {
+    namespace 'com.diysandbox.android'
+    compileSdk = flutter.compileSdkVersion
+    ndkVersion = flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility = 17
+        targetCompatibility = 17
+    }
+
+    kotlinOptions {
+        jvmTarget = 17
+    }
+    signingConfigs {
+        if (hasKeystoreFile) {
+            release {
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+            }
+        }
+    }
+
+    defaultConfig {
+        applicationId 'com.diysandbox.android'
+        minSdk = 26
+        targetSdk = 35
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+        // 仅打包 arm64-v8a (现代设备主流架构)
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    lintOptions {
+        disable 'InvalidPackage'
+    }
+
+    flavorDimensions "distribution"
+    productFlavors {
+        normal {
+            dimension "distribution"
+        }
+        profileTest {
+            dimension "distribution"
+            applicationIdSuffix ".profile"
+            resValue "string", "app_name", "DIY Sandbox"
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig hasKeystoreFile ? signingConfigs.release : signingConfigs.debug
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // 禁用对特定原生库的strip操作，避免处理错误
+            packagingOptions {
+                doNotStrip '**/libsudo.so'
+            }
+        }
+        debug {
+            signingConfig hasKeystoreFile ? signingConfigs.release : signingConfigs.debug
+            minifyEnabled false
+            shrinkResources false
+            // 禁用对特定原生库的strip操作，避免处理错误
+            packagingOptions {
+                doNotStrip '**/libsudo.so'
+            }
+        }
+        profile {
+            signingConfig hasKeystoreFile ? signingConfigs.release : signingConfigs.debug
+            minifyEnabled false
+            shrinkResources false
+            packagingOptions {
+                doNotStrip '**/libsudo.so'
+            }
+        }
+    }
+
+    project.android.applicationVariants.all { variant ->
+        variant.outputs.each { output ->
+            output.versionCodeOverride = flutter.versionCode
+            output.outputFileName = "Android-DIY-Sandbox-v${variant.versionName}-${variant.buildType.name}.apk"
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    packagingOptions {
+        jniLibs {
+            pickFirsts += ['**/libc++_shared.so']
+        }
+    }
+
+    buildFeatures {
+        aidl true
+    }
+}
+
+flutter {
+    source '../..'
+}
+dependencies {
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.media:media:1.7.0'
+}

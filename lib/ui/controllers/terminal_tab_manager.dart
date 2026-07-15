@@ -1,0 +1,441 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:flutter_pty/flutter_pty.dart';
+import 'package:get/get.dart';
+import 'package:global_repository/global_repository.dart';
+import 'package:xterm/xterm.dart';
+
+import '../../core/utils/file_utils.dart';
+
+/// 后台 PTY 任务句柄 (可等待完成或强制取消)。
+class EphemeralRunHandle {
+  final Future<void> done;
+  final void Function() cancel;
+  const EphemeralRunHandle({required this.done, required this.cancel});
+}
+
+/// 终端标签页类型
+enum TerminalTabType {
+  system, // 系统终端（可交互、可关闭）
+}
+
+/// 终端标签页数据模型
+class TerminalTab {
+  static const int _maxLogChars = 120000;
+
+  final String id;
+  final String title;
+  final TerminalTabType type;
+  final Terminal terminal;
+  final TerminalController controller;
+  final Pty? pty;
+  bool isActive;
+  String _logText = '';
+  StreamSubscription? _ptySubscription;
+
+  TerminalTab({
+    required this.id,
+    required this.title,
+    required this.type,
+    required this.terminal,
+    required this.controller,
+    this.pty,
+    this.isActive = false,
+  });
+
+  String get logText => _logText;
+
+  void appendLog(String text) {
+    if (text.isEmpty) return;
+    _logText += text
+        .replaceAll(RegExp(r'\x1B\[[0-9;?]*[ -/]*[@-~]'), '')
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n');
+    if (_logText.length > _maxLogChars) {
+      _logText = _logText.substring(_logText.length - _maxLogChars);
+    }
+  }
+
+  void clearLog() {
+    _logText = '';
+  }
+}
+
+/// 多终端标签页管理器
+class TerminalTabManager extends GetxController {
+  // 所有终端标签页列表
+  final RxList<TerminalTab> tabs = <TerminalTab>[].obs;
+
+  // 当前激活的标签页索引
+  final RxInt activeTabIndex = 0.obs;
+
+  // 标签页被关闭时回调 (tabId) — 供 HomeController 清理 spawn 运行态
+  void Function(String tabId)? onTabClosed;
+
+  /// 添加新的系统终端标签页
+  Future<void> addSystemTerminalTab() async {
+    try {
+      final newIndex =
+          tabs.where((t) => t.type == TerminalTabType.system).length + 1;
+      final tabId = 'system_${DateTime.now().millisecondsSinceEpoch}';
+
+      // 创建新的终端实例
+      final newTerminal = Terminal(
+        maxLines: 10000,
+      );
+
+      // 创建新的PTY实例
+      final newPty = createPTY(
+        rows: newTerminal.viewHeight,
+        columns: newTerminal.viewWidth,
+      );
+
+      // 标志：是否已经创建了标签页
+      var tabCreated = false;
+      TerminalTab? createdTab;
+
+      // 连接终端的 onResize 和 onOutput 事件（需要在监听输出前就连接好）
+      newTerminal.onResize = (width, height, pixelWidth, pixelHeight) {
+        newPty.resize(height, width);
+      };
+
+      newTerminal.onOutput = (data) {
+        newPty.writeString(data);
+      };
+
+      // 监听PTY输出，等待登录完成后再创建标签页
+      StreamSubscription? ptySub;
+      ptySub = newPty.output
+          .cast<List<int>>()
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .listen((event) {
+        // 检测是否包含 root@localhost 提示符
+        if (!tabCreated && event.contains('root@localhost')) {
+          tabCreated = true;
+
+          // 创建新标签页
+          final newTab = TerminalTab(
+            id: tabId,
+            title: '终端 $newIndex',
+            type: TerminalTabType.system,
+            terminal: newTerminal,
+            controller: TerminalController(),
+            pty: newPty,
+            isActive: false,
+          );
+          createdTab = newTab;
+          newTab._ptySubscription = ptySub;
+
+          // 将所有现有标签页设为非激活状态
+          for (var tab in tabs) {
+            tab.isActive = false;
+          }
+
+          // 添加新标签页并激活
+          tabs.add(newTab);
+          newTab.isActive = true;
+          activeTabIndex.value = tabs.length - 1;
+
+          Log.i('添加新系统终端标签页: ${newTab.title} (ID: ${newTab.id})',
+              tag: 'TerminalTabManager');
+          // 不要 return，继续处理后续输出
+        }
+
+        // 标签页创建后，正常输出所有内容
+        if (tabCreated) {
+          createdTab?.appendLog(event);
+          newTerminal.write(event);
+        }
+        // 标签页创建前，不输出任何内容（跳过登录过程的输出）
+      });
+
+      // 登录到ubuntu容器
+      final command =
+          'source ${RuntimeEnvir.homePath}/common.sh\nlogin_ubuntu "bash" \n';
+      newPty.writeString(command);
+    } catch (e) {
+      Log.e('添加系统终端标签页失败: $e', tag: 'TerminalTabManager');
+      Get.snackbar('错误', '创建终端失败: $e');
+    }
+  }
+
+  /// 后台执行命令 (不创建可见终端 tab), 用于启动时 Ubuntu 安装等。
+  /// 返回 [EphemeralRunHandle] 可在任务完成前强制取消。
+  Future<EphemeralRunHandle> runEphemeralCommand({
+    required String command,
+    String? onDoneMarker,
+    void Function(String chunk)? onOutput,
+    void Function()? onCommandDone,
+    bool hideEcho = false,
+  }) async {
+    final completer = Completer<void>();
+    Pty? pty;
+    StreamSubscription? sub;
+    var doneNotified = false;
+    var markerSeen = false;
+    final startedAt = DateTime.now();
+
+    void finish({bool force = false}) {
+      if (doneNotified) return;
+      if (!force &&
+          onDoneMarker != null &&
+          !markerSeen &&
+          DateTime.now().difference(startedAt) < const Duration(seconds: 3)) {
+        return;
+      }
+      doneNotified = true;
+      sub?.cancel();
+      try {
+        pty?.kill();
+      } catch (_) {}
+      onCommandDone?.call();
+      if (!completer.isCompleted) completer.complete();
+    }
+
+    void cancel() => finish(force: true);
+
+    try {
+      pty = createPTY(rows: 24, columns: 100);
+
+      sub = pty.output
+          .cast<List<int>>()
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .listen(
+        (event) {
+          onOutput?.call(event);
+          if (onDoneMarker != null && _containsDoneMarker(event, onDoneMarker)) {
+            markerSeen = true;
+            finish(force: true);
+          }
+        },
+        onDone: () => finish(force: markerSeen),
+        onError: (_) => finish(force: markerSeen),
+      );
+
+      pty.writeString(
+        hideEcho
+            ? '$command\n'
+            : 'stty -echo 2>/dev/null\n$command\nexit\n',
+      );
+    } catch (e) {
+      Log.e('后台命令执行失败: $e', tag: 'TerminalTabManager');
+      if (!completer.isCompleted) completer.complete();
+      rethrow;
+    }
+
+    return EphemeralRunHandle(
+      done: completer.future,
+      cancel: () {
+        if (pty != null) {
+          final pid = pty!.pid;
+          try {
+            pty!.kill();
+          } catch (_) {}
+          if (pid > 0) {
+            try {
+              Process.killPid(pid, ProcessSignal.sigkill);
+            } catch (_) {}
+          }
+        }
+        cancel();
+      },
+    );
+  }
+
+  Future<String> addCommandTerminalTab({
+    required String title,
+    required String command,
+    String? onDoneMarker,
+    void Function()? onCommandDone,
+  }) async {
+    try {
+      final tabId = 'command_${DateTime.now().millisecondsSinceEpoch}';
+      final newTerminal = Terminal(maxLines: 10000);
+      final newPty = createPTY(
+        rows: newTerminal.viewHeight,
+        columns: newTerminal.viewWidth,
+      );
+
+      newTerminal.onResize = (width, height, pixelWidth, pixelHeight) {
+        newPty.resize(height, width);
+      };
+      newTerminal.onOutput = (data) {
+        newPty.writeString(data);
+      };
+
+      final newTab = TerminalTab(
+        id: tabId,
+        title: title,
+        type: TerminalTabType.system,
+        terminal: newTerminal,
+        controller: TerminalController(),
+        pty: newPty,
+        isActive: true,
+      );
+
+      for (var tab in tabs) {
+        tab.isActive = false;
+      }
+      tabs.add(newTab);
+      activeTabIndex.value = tabs.length - 1;
+
+      var doneNotified = false;
+      var markerSeen = false;
+      final startedAt = DateTime.now();
+      void notifyDone({bool force = false}) {
+        if (doneNotified) return;
+        if (!force &&
+            onDoneMarker != null &&
+            !markerSeen &&
+            DateTime.now().difference(startedAt) <
+                const Duration(seconds: 3)) {
+          return;
+        }
+        doneNotified = true;
+        onCommandDone?.call();
+      }
+
+      newTab._ptySubscription = newPty.output
+          .cast<List<int>>()
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .listen((event) {
+        newTab.appendLog(event);
+        newTerminal.write(event);
+        if (onDoneMarker != null && _containsDoneMarker(event, onDoneMarker)) {
+          markerSeen = true;
+          notifyDone(force: true);
+        }
+      }, onDone: () => notifyDone(force: markerSeen), onError: (_) => notifyDone(force: markerSeen));
+
+      newPty.writeString('$command\n');
+      return tabId;
+    } catch (e) {
+      Log.e('添加命令终端标签页失败: $e', tag: 'TerminalTabManager');
+      Get.snackbar('错误', '创建命令终端失败: $e');
+      return '';
+    }
+  }
+
+  /// 按标签页 id 关闭 (会 kill 其 PTY)。
+  void closeTabById(String id) {
+    final idx = tabs.indexWhere((t) => t.id == id);
+    if (idx >= 0) closeTab(idx);
+  }
+
+  bool _containsDoneMarker(String event, String marker) {
+    final normalized = event.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    return normalized.split('\n').any((line) => line.trim() == marker);
+  }
+
+  /// 切换到指定标签页
+  void switchToTab(int index) {
+    if (index >= 0 && index < tabs.length) {
+      // 将所有标签页设为非激活状态
+      for (var tab in tabs) {
+        tab.isActive = false;
+      }
+
+      // 激活指定标签页
+      tabs[index].isActive = true;
+      activeTabIndex.value = index;
+
+      Log.i('切换到标签页: ${tabs[index].title} (索引: $index)',
+          tag: 'TerminalTabManager');
+    }
+  }
+
+  /// 关闭指定标签页
+  void closeTab(int index) {
+    if (index < 0 || index >= tabs.length) {
+      return;
+    }
+
+    final tab = tabs[index];
+
+    try {
+      // 先取消输出流订阅，防止旧的流写已释放的 tab/terminal
+      tab._ptySubscription?.cancel();
+      tab._ptySubscription = null;
+
+      if (tab.pty != null) {
+        final pid = tab.pty!.pid;
+        final killed = tab.pty!.kill();
+        Log.i('关闭终端PTY: ${tab.title} (PID: $pid, SIGTERM sent: $killed)',
+            tag: 'TerminalTabManager');
+        // 2秒后强制 SIGKILL，防止进程无视 SIGTERM
+        Future.delayed(const Duration(seconds: 2), () {
+          try {
+            Process.killPid(pid, ProcessSignal.sigkill);
+            Log.i('强制终止PID: $pid (SIGKILL)', tag: 'TerminalTabManager');
+          } catch (_) {
+            // 进程可能已退出
+          }
+        });
+      }
+
+      // 移除标签页
+      tabs.removeAt(index);
+
+      // 通知外部: 该 tab 已关闭 (用于同步 spawn 运行态等)
+      onTabClosed?.call(tab.id);
+
+      // 如果关闭的是当前激活的标签页，切换到前一个标签页
+      if (index == activeTabIndex.value) {
+        final newIndex = (index > 0) ? index - 1 : 0;
+        if (tabs.isNotEmpty) {
+          switchToTab(newIndex);
+        }
+      } else if (index < activeTabIndex.value) {
+        // 如果关闭的标签页在当前激活标签页之前，需要更新索引
+        activeTabIndex.value = activeTabIndex.value - 1;
+      }
+
+      Log.i('关闭标签页: ${tab.title}', tag: 'TerminalTabManager');
+    } catch (e) {
+      Log.e('关闭标签页失败: $e', tag: 'TerminalTabManager');
+    }
+  }
+
+  /// 拖动排序: 移动标签并保持当前激活标签不变
+  void reorderTab(int oldIndex, int newIndex) {
+    if (oldIndex < 0 || oldIndex >= tabs.length) return;
+    if (newIndex < 0 || newIndex >= tabs.length) return;
+    if (oldIndex == newIndex) return;
+    final active = (activeTabIndex.value >= 0 && activeTabIndex.value < tabs.length)
+        ? tabs[activeTabIndex.value]
+        : null;
+    final moved = tabs.removeAt(oldIndex);
+    tabs.insert(newIndex, moved);
+    if (active != null) activeTabIndex.value = tabs.indexOf(active);
+  }
+
+  /// 获取当前激活的标签页
+  TerminalTab? get activeTab {
+    if (activeTabIndex.value >= 0 && activeTabIndex.value < tabs.length) {
+      return tabs[activeTabIndex.value];
+    }
+    return null;
+  }
+
+  @override
+  void onClose() {
+    // 关闭所有系统终端的PTY
+    for (var tab in tabs) {
+      if (tab.type == TerminalTabType.system) {
+        tab._ptySubscription?.cancel();
+        tab._ptySubscription = null;
+        if (tab.pty != null) {
+          try {
+            tab.pty!.kill();
+            Log.i('清理终端PTY: ${tab.title}', tag: 'TerminalTabManager');
+          } catch (e) {
+            Log.e('清理终端PTY失败: $e', tag: 'TerminalTabManager');
+          }
+        }
+      }
+    }
+    tabs.clear();
+    super.onClose();
+  }
+}
